@@ -257,8 +257,28 @@ body {
   border-radius: 8px;
   z-index: 900;
   font-size: 0.85rem;
-  max-width: 420px;
+  max-width: 480px;
   text-align: center;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+#error-retry-btn {
+  background: transparent;
+  border: 1px solid #ffb3c1;
+  color: #ffb3c1;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+#error-retry-btn:hover {
+  background: rgba(255, 179, 193, 0.15);
 }
 
 #error-banner.hidden {
