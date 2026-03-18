@@ -14,6 +14,18 @@ const GRAPHQL_URL = 'https://otp.services.porto.digital/otp/routers/default/inde
 /** Intervalo de actualização automática (milissegundos) */
 const REFRESH_INTERVAL_MS = 30_000;
 
+/** Número máximo de tentativas em caso de erro 5xx ou falha de rede */
+const GRAPHQL_MAX_RETRIES = 2;
+
+/** Atraso base entre tentativas (ms); dobra a cada retry */
+const GRAPHQL_RETRY_DELAY_MS = 1500;
+
+/** Chave de armazenamento localStorage para as rotas/paragens */
+const CACHE_KEY_ROUTES = 'metroPorto_routes_v1';
+
+/** Tempo de vida da cache de rotas (24 horas em ms) */
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
 /** Segundos num dia (usado na normalização de stoptimes que cruzam a meia-noite) */
 const SECONDS_PER_DAY = 86400;
 
@@ -98,20 +110,91 @@ function secsToHHMM(secs) {
 }
 
 /**
- * Executa uma query GraphQL via POST.
+ * Executa uma query GraphQL via POST, com retentativas automáticas
+ * em caso de erro de servidor (5xx) ou falha de rede.
  * @param {string} query
  * @returns {Promise<object>}
  */
 async function graphql(query) {
-  const res = await fetch(GRAPHQL_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  if (json.errors) throw new Error(json.errors.map(e => e.message).join('; '));
-  return json.data;
+  let lastError;
+
+  for (let attempt = 0; attempt <= GRAPHQL_MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch(GRAPHQL_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json.errors) throw new Error(json.errors.map(e => e.message).join('; '));
+      return json.data;
+    } catch (err) {
+      lastError = err;
+      // Tentar novamente apenas em erros de servidor (5xx) ou erros de rede (TypeError)
+      const isRetryable = /^HTTP 5\d\d$/.test(err.message) || err instanceof TypeError;
+      if (attempt < GRAPHQL_MAX_RETRIES && isRetryable) {
+        await new Promise(r => setTimeout(r, GRAPHQL_RETRY_DELAY_MS * (attempt + 1)));
+        continue;
+      }
+      break;
+    }
+  }
+
+  throw lastError;
+}
+
+// ── Cache persistente (localStorage) ────────────────────────────────────────
+
+/**
+ * Lê as rotas/paragens da cache persistente (localStorage).
+ * Devolve null se não existir cache ou se estiver expirada.
+ * @returns {Array|null}
+ */
+function loadRoutesFromCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY_ROUTES);
+    if (!raw) return null;
+    const { data, timestamp } = JSON.parse(raw);
+    if (Date.now() - timestamp > CACHE_TTL_MS) {
+      localStorage.removeItem(CACHE_KEY_ROUTES);
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Guarda as rotas/paragens na cache persistente (localStorage).
+ * @param {Array} routes
+ */
+function saveRoutesToCache(routes) {
+  try {
+    localStorage.setItem(CACHE_KEY_ROUTES, JSON.stringify({
+      data: routes,
+      timestamp: Date.now(),
+    }));
+  } catch {
+    // Ignorar erros de armazenamento (ex: modo privado, quota excedida)
+  }
+}
+
+/**
+ * Lê as rotas da cache persistente sem verificar a data de expiração.
+ * Usado como fallback quando a API está indisponível.
+ * @returns {Array|null}
+ */
+function loadStaleRoutesFromCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY_ROUTES);
+    if (!raw) return null;
+    const { data } = JSON.parse(raw);
+    return data || null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Queries GraphQL ─────────────────────────────────────────────────────────
@@ -492,11 +575,13 @@ function hideLoading() {
   document.getElementById('loading-overlay').classList.add('hidden');
 }
 
-function showError(msg) {
+function showError(msg, autoDismiss = true) {
   const banner = document.getElementById('error-banner');
   document.getElementById('error-message').textContent = msg;
   banner.classList.remove('hidden');
-  setTimeout(() => banner.classList.add('hidden'), 8000);
+  if (autoDismiss) {
+    setTimeout(() => banner.classList.add('hidden'), 8000);
+  }
 }
 
 // ── Ciclo principal ──────────────────────────────────────────────────────────
@@ -520,10 +605,29 @@ async function loadAndRender() {
   refreshBtn.disabled = true;
 
   try {
-    // ── 1. Rotas e padrões (cache após primeira chamada) ────────────────────
+    // ── 1. Rotas e padrões (cache localStorage → API → cache stale) ─────────
     if (!cachedRoutes) {
-      showLoading('A carregar rotas e paragens…');
-      cachedRoutes = await fetchRoutesAndPatterns();
+      // Tentar primeiro a cache persistente (válida por 24h)
+      cachedRoutes = loadRoutesFromCache();
+
+      if (!cachedRoutes) {
+        showLoading('A carregar rotas e paragens…');
+        try {
+          cachedRoutes = await fetchRoutesAndPatterns();
+          saveRoutesToCache(cachedRoutes);
+        } catch (fetchErr) {
+          // API falhou; tentar usar dados antigos da cache como fallback
+          const stale = loadStaleRoutesFromCache();
+          if (stale) {
+            cachedRoutes = stale;
+            console.warn('[MetroPorto] API indisponível; a usar cache expirada para rotas.');
+            showError('API temporariamente indisponível. A mostrar rotas em cache.', false);
+          } else {
+            // Sem cache alguma — não é possível continuar
+            throw fetchErr;
+          }
+        }
+      }
     }
 
     // ── 2. Desenhar linhas e paragens apenas uma vez ─────────────────────────
@@ -554,8 +658,12 @@ async function loadAndRender() {
       patternFetches.map(({ promise }) => promise)
     );
 
+    let failedCount = 0;
     results.forEach((result, idx) => {
-      if (result.status !== 'fulfilled' || !result.value) return;
+      if (result.status !== 'fulfilled' || !result.value) {
+        failedCount++;
+        return;
+      }
 
       const { route, pattern } = patternFetches[idx];
       const patternData = result.value;
@@ -579,6 +687,10 @@ async function loadAndRender() {
       });
     });
 
+    if (failedCount === results.length && results.length > 0) {
+      showError('Não foi possível obter posições em tempo real. A tentar novamente em breve…');
+    }
+
     // ── 4. Remover marcadores de trips que terminaram ────────────────────────
     removeStaleMarkers(activeTripIds);
 
@@ -588,7 +700,7 @@ async function loadAndRender() {
 
   } catch (err) {
     console.error('[MetroPorto] Erro ao carregar dados:', err);
-    showError(`Erro ao carregar dados: ${err.message}`);
+    showError(`Erro ao carregar dados: ${err.message}`, false);
   } finally {
     hideLoading();
     isLoading = false;
@@ -642,6 +754,13 @@ function setupSidebarToggle() {
 function init() {
   injectPulseAnimation();
   setupSidebarToggle();
+
+  // Botão de retry no banner de erro
+  document.getElementById('error-retry-btn').addEventListener('click', () => {
+    document.getElementById('error-banner').classList.add('hidden');
+    clearTimeout(refreshTimeout);
+    loadAndRender();
+  });
 
   // Botão de refresh manual
   document.getElementById('refresh-btn').addEventListener('click', () => {
