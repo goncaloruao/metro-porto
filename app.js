@@ -30,7 +30,7 @@ const GRAPHQL_MAX_CONCURRENT = 4;
 const LOG_PREFIX = '[MetroPorto]';
 
 /** Chave de armazenamento localStorage para as rotas/paragens */
-const CACHE_KEY_ROUTES = 'metroPorto_routes_v1';
+const CACHE_KEY_ROUTES = 'metroPorto_routes_v2';
 
 /** Tempo de vida da cache de rotas (24 horas em ms) */
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -54,7 +54,7 @@ const BUS_PATTERN_DELAY_MS = 50;
 const MOVEME_BASE_URL = 'https://move-me.mobi';
 
 /** Chave de acesso à API move-me.mobi */
-const MOVEME_API_KEY = 'C00Z8SHC8WSS0-MN';
+const MOVEME_API_KEY = 'C00Z8S0HKZ8H5-MN';
 
 /** Nome do operador Metro do Porto na API move-me.mobi */
 const MOVEME_METRO_OPERATOR = 'METRO DO PORTO';
@@ -328,6 +328,7 @@ async function fetchRoutesAndPatterns() {
         }
         stops {
           id
+          gtfsId
           name
           lat
           lon
@@ -617,8 +618,10 @@ async function fetchStopDepartures(numericStopId) {
 function detectPatternDirection(patternStops, stopDepsMap) {
   if (patternStops.length < 2) return null;
 
-  const firstId = otpStopNumericId(patternStops[0].id);
-  const lastId  = otpStopNumericId(patternStops[patternStops.length - 1].id);
+  const firstStop = patternStops[0];
+  const lastStop  = patternStops[patternStops.length - 1];
+  const firstId = otpStopNumericId(firstStop.gtfsId || firstStop.id);
+  const lastId  = otpStopNumericId(lastStop.gtfsId  || lastStop.id);
 
   const firstDeps = stopDepsMap.get(firstId) || [];
   const lastDeps  = stopDepsMap.get(lastId)  || [];
@@ -681,7 +684,7 @@ async function fetchPatternTripsMoveMe(pattern) {
   // ── 1. Obter partidas para todas as paragens do pattern em paralelo ────────
   const stopResults = await runConcurrent(
     pattern.stops.map(stop => async () => {
-      const numId = otpStopNumericId(stop.id);
+      const numId = otpStopNumericId(stop.gtfsId || stop.id);
       const deps  = await fetchStopDepartures(numId).catch(() => []);
       return { stop, deps: Array.isArray(deps) ? deps : [] };
     }),
@@ -694,7 +697,7 @@ async function fetchPatternTripsMoveMe(pattern) {
     if (result.status !== 'fulfilled') continue;
     const { stop, deps } = result.value;
     fulfilled.push({ stop, deps });
-    stopDepsMap.set(otpStopNumericId(stop.id), deps);
+    stopDepsMap.set(otpStopNumericId(stop.gtfsId || stop.id), deps);
   }
 
   // ── 2. Detectar direcção move-me que corresponde a este pattern OTP ────────
