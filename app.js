@@ -300,7 +300,7 @@ function loadStaleRoutesFromCache() {
  */
 async function fetchRoutesAndPatterns() {
   const data = await graphql(`{
-    routes(transportModes: [{transportMode: SUBWAY}]) {
+    routes(transportModes: [SUBWAY]) {
       id
       shortName
       longName
@@ -370,7 +370,7 @@ function delay(ms) {
  */
 async function fetchBusRoutes() {
   const data = await graphql(`{
-    routes(transportModes: [{transportMode: BUS}]) {
+    routes(transportModes: [BUS]) {
       id
       shortName
       longName
