@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>🚇 Metro Porto — Tracker em Tempo Real</title>
+  <title>🚇 Metro Porto & 🚌 STCP — Tracker em Tempo Real</title>
 
   <!-- MapLibre GL JS (CDN) -->
   <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
@@ -20,17 +20,35 @@
   <!-- ── Sidebar ────────────────────────────────────────── -->
   <aside id="sidebar">
     <div id="sidebar-header">
-      <h1>🚇 Metro Porto</h1>
+      <h1>🚇 Metro & 🚌 STCP</h1>
     </div>
 
     <div id="sidebar-body">
       <!-- Última actualização -->
       <p id="last-updated">A carregar…</p>
 
-      <!-- Comboios activos por linha -->
+      <!-- Toggles de camadas -->
       <div>
-        <p class="section-title">Comboios activos</p>
+        <p class="section-title">Camadas</p>
+        <div class="toggle-row">
+          <button id="toggle-metro" class="layer-toggle">🚇 Metro</button>
+          <button id="toggle-stcp" class="layer-toggle">🚌 STCP</button>
+        </div>
+      </div>
+
+      <!-- Veículos activos -->
+      <div>
+        <p class="section-title">Veículos activos</p>
+
+        <!-- Metro -->
+        <p class="subsection-title">🚇 Metro</p>
         <div id="active-trains">
+          <!-- Preenchido dinamicamente por app.js -->
+        </div>
+
+        <!-- STCP -->
+        <p class="subsection-title">🚌 STCP</p>
+        <div id="active-buses">
           <!-- Preenchido dinamicamente por app.js -->
         </div>
       </div>
@@ -60,6 +78,7 @@
   <!-- ── Mensagem de erro ───────────────────────────────── -->
   <div id="error-banner" class="hidden">
     ⚠️ <span id="error-message">Erro ao carregar dados.</span>
+    <button id="error-retry-btn">↻ Tentar novamente</button>
   </div>
 
   <!-- Lógica da aplicação -->
