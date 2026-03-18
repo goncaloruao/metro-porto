@@ -50,6 +50,18 @@ const MAX_BUS_ROUTES = 30;
 /** Pausa entre pedidos de pattern STCP para não sobrecarregar a API (ms) */
 const BUS_PATTERN_DELAY_MS = 50;
 
+/** Endpoint da API move-me.mobi para dados de próximas partidas */
+const MOVEME_BASE_URL = 'https://move-me.mobi';
+
+/** Chave de acesso à API move-me.mobi */
+const MOVEME_API_KEY = 'C00Z8SHC8WSS0-MN';
+
+/** Nome do operador Metro do Porto na API move-me.mobi */
+const MOVEME_METRO_OPERATOR = 'METRO DO PORTO';
+
+/** Tempo médio estimado entre paragens consecutivas do Metro do Porto (segundos) */
+const MOVEME_AVG_INTER_STOP_SEC = 150;
+
 /**
  * Cores oficiais das linhas do Metro do Porto.
  * Chave = shortName da rota (ex: "A", "B", …)
@@ -296,14 +308,17 @@ function loadStaleRoutesFromCache() {
 
 /**
  * Obtém todas as rotas de metro e os respectivos padrões (patterns) com paragens.
+ * O filtro por modo é feito no cliente para evitar dependência do argumento
+ * `transportModes` do servidor OTP, que tem variado entre versões.
  * @returns {Promise<Array>}
  */
 async function fetchRoutesAndPatterns() {
   const data = await graphql(`{
-    routes(transportModes: [SUBWAY]) {
+    routes {
       id
       shortName
       longName
+      mode
       patterns {
         id
         headsign
@@ -317,7 +332,7 @@ async function fetchRoutesAndPatterns() {
       }
     }
   }`);
-  return data.routes;
+  return data.routes.filter(r => r.mode === 'SUBWAY');
 }
 
 /**
@@ -366,14 +381,16 @@ function delay(ms) {
 
 /**
  * Obtém as rotas de autocarro STCP e os respectivos padrões com paragens.
+ * O filtro por modo é feito no cliente (ver fetchRoutesAndPatterns).
  * @returns {Promise<Array>}
  */
 async function fetchBusRoutes() {
   const data = await graphql(`{
-    routes(transportModes: [BUS]) {
+    routes {
       id
       shortName
       longName
+      mode
       patterns {
         id
         headsign
@@ -387,10 +404,194 @@ async function fetchBusRoutes() {
       }
     }
   }`);
-  return data.routes;
+  return data.routes.filter(r => r.mode === 'BUS');
 }
 
-// ── Lógica de interpolação ──────────────────────────────────────────────────
+// ── API move-me.mobi ─────────────────────────────────────────────────────────
+
+/**
+ * Extrai o identificador numérico de uma paragem a partir do ID GTFS do OTP.
+ * Ex: "portopt:169223" → "169223", "1:169223" → "169223"
+ * @param {string} otpId
+ * @returns {string}
+ */
+function otpStopNumericId(otpId) {
+  return otpId.split(':').pop();
+}
+
+/**
+ * Obtém as próximas partidas para uma paragem do Metro do Porto via move-me.mobi.
+ * @param {string} numericStopId  ID numérico da paragem (ex: "169223")
+ * @returns {Promise<Array>}  Array de objectos de partida
+ */
+async function fetchStopDepartures(numericStopId) {
+  const operator = encodeURIComponent(MOVEME_METRO_OPERATOR);
+  const url = `${MOVEME_BASE_URL}/stop/${operator}/${numericStopId}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GRAPHQL_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'apikey': MOVEME_API_KEY,
+        'Accept': '*/*',
+        'Content-Type': 'application/json; charset=utf-8',
+        'Referer': 'https://move-me.mobi/next-departures',
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+/**
+ * Determina qual das direcções do move-me.mobi (1 ou 2) corresponde ao sentido
+ * do pattern OTP, comparando os valores de `order` da primeira e última paragem.
+ * A direcção correcta é aquela em que `order` da primeira paragem < `order` da última.
+ * @param {Array}  patternStops  Paragens do pattern OTP (ordenadas)
+ * @param {Map}    stopDepsMap   Mapa numericId → Array<departure>
+ * @returns {number|null}  1, 2 ou null se não for possível determinar
+ */
+function detectPatternDirection(patternStops, stopDepsMap) {
+  if (patternStops.length < 2) return null;
+
+  const firstId = otpStopNumericId(patternStops[0].id);
+  const lastId  = otpStopNumericId(patternStops[patternStops.length - 1].id);
+
+  const firstDeps = stopDepsMap.get(firstId) || [];
+  const lastDeps  = stopDepsMap.get(lastId)  || [];
+
+  for (const dir of [1, 2]) {
+    const firstOrders = firstDeps.filter(d => d.direction === dir).map(d => d.order);
+    const lastOrders  = lastDeps.filter(d => d.direction === dir).map(d => d.order);
+
+    if (!firstOrders.length || !lastOrders.length) continue;
+
+    const avgFirst = firstOrders.reduce((a, b) => a + b, 0) / firstOrders.length;
+    const avgLast  = lastOrders.reduce((a, b) => a + b, 0) / lastOrders.length;
+
+    if (avgFirst < avgLast) return dir;
+  }
+  return null; // não foi possível determinar; incluir todas as direcções
+}
+
+/**
+ * Obtém dados de viagens para um pattern do Metro usando a API move-me.mobi.
+ * Substitui fetchPatternTrips para as rotas do metro, construindo stoptimes
+ * sintéticos a partir dos tempos de chegada reais (campo `duration` em minutos).
+ *
+ * Algoritmo:
+ *  1. Obtém partidas para todas as paragens do pattern via move-me.mobi.
+ *  2. Detecta qual direcção move-me (1/2) corresponde ao sentido OTP.
+ *  3. Agrupa por tripId e ordena por `order`.
+ *  4. Constrói stoptimes com arrivalSec = nowSec + duration * 60.
+ *  5. Adiciona uma paragem sintética anterior (estimada) para permitir
+ *     interpolação de posição pelo estimateTripPosition existente.
+ *
+ * @param {object} pattern  Pattern do OTP (com array stops)
+ * @returns {Promise<object>}  { trips: [{id, tripHeadsign, stoptimes}] }
+ */
+async function fetchPatternTripsMoveMe(pattern) {
+  const nowSec = secondsSinceMidnight();
+
+  // 1. Obter partidas para todas as paragens do pattern em paralelo
+  const stopResults = await runConcurrent(
+    pattern.stops.map(stop => async () => {
+      const numId = otpStopNumericId(stop.id);
+      const deps  = await fetchStopDepartures(numId).catch(() => []);
+      return { stop, deps: Array.isArray(deps) ? deps : [] };
+    }),
+    GRAPHQL_MAX_CONCURRENT,
+  );
+
+  // Construir mapa numericId → deps e lista de resultados válidos
+  const stopDepsMap = new Map();
+  const fulfilled   = [];
+  for (const result of stopResults) {
+    if (result.status !== 'fulfilled') continue;
+    const { stop, deps } = result.value;
+    fulfilled.push({ stop, deps });
+    stopDepsMap.set(otpStopNumericId(stop.id), deps);
+  }
+
+  // 2. Detectar direcção move-me que corresponde a este pattern OTP
+  const direction = detectPatternDirection(pattern.stops, stopDepsMap);
+
+  // 3. Agrupar partidas por tripId
+  const tripMap = new Map(); // tripId → { headsign, entries: [{order, stop, arrivalSec, isRT}] }
+
+  for (const { stop, deps } of fulfilled) {
+    const filtered = direction != null ? deps.filter(d => d.direction === direction) : deps;
+    for (const dep of filtered) {
+      const key = String(dep.tripId);
+      if (!tripMap.has(key)) {
+        tripMap.set(key, { headsign: dep.destination, entries: [] });
+      }
+      tripMap.get(key).entries.push({
+        order:      dep.order,
+        stop,
+        arrivalSec: nowSec + dep.duration * 60,
+        isRT:       dep.isRT,
+      });
+    }
+  }
+
+  // 4. Construir trips com stoptimes sintéticos
+  const trips = [];
+
+  for (const [tripId, tripData] of tripMap) {
+    // Ordenar por order e manter apenas paragens com chegada futura
+    tripData.entries.sort((a, b) => a.order - b.order);
+    const upcoming = tripData.entries.filter(e => e.arrivalSec > nowSec);
+    if (!upcoming.length) continue;
+
+    const stoptimes = upcoming.map(e => ({
+      stop:               { id: e.stop.id, name: e.stop.name, lat: e.stop.lat, lon: e.stop.lon },
+      scheduledArrival:   e.arrivalSec,
+      scheduledDeparture: e.arrivalSec,
+      realtimeArrival:    e.arrivalSec,
+      realtimeDeparture:  e.arrivalSec,
+      realtime:           e.isRT,
+    }));
+
+    // 5. Adicionar paragem sintética anterior para permitir interpolação
+    //    O comboio aproxima-se de stoptimes[0]; estimamos quando saiu da paragem anterior.
+    const firstEntry = upcoming[0];
+    if (firstEntry.order > 1) {
+      // Calcular tempo inter-paragem a partir dos dados disponíveis ou usar o valor por omissão
+      let interStopSec = MOVEME_AVG_INTER_STOP_SEC;
+      if (upcoming.length >= 2) {
+        const timeSpan = upcoming[upcoming.length - 1].arrivalSec - upcoming[0].arrivalSec;
+        const orderSpan = upcoming[upcoming.length - 1].order - upcoming[0].order;
+        if (orderSpan > 0) interStopSec = Math.max(30, timeSpan / orderSpan);
+      }
+
+      // Paragem anterior no pattern OTP (order é 1-based; index é 0-based)
+      const prevIdx  = Math.max(0, firstEntry.order - 2);
+      const prevStop = pattern.stops[prevIdx] || pattern.stops[0];
+
+      const prevArr = stoptimes[0].scheduledArrival - interStopSec;
+      stoptimes.unshift({
+        stop:               { id: prevStop.id, name: prevStop.name, lat: prevStop.lat, lon: prevStop.lon },
+        scheduledArrival:   prevArr,
+        scheduledDeparture: prevArr,
+        realtimeArrival:    prevArr,
+        realtimeDeparture:  prevArr,
+        realtime:           stoptimes[0].realtime,
+      });
+    }
+
+    if (stoptimes.length >= 2) {
+      trips.push({ id: tripId, tripHeadsign: tripData.headsign, stoptimes });
+    }
+  }
+
+  return { trips };
+}
 
 /**
  * Calcula a posição estimada de um comboio entre duas paragens,
@@ -1097,7 +1298,14 @@ async function loadAndRender() {
     );
 
     const results = await runConcurrent(
-      patternFetches.map(({ pattern }) => () => fetchPatternTrips(pattern.id)),
+      patternFetches.map(({ pattern }) => async () => {
+        try {
+          return await fetchPatternTripsMoveMe(pattern);
+        } catch (err) {
+          console.warn(`${LOG_PREFIX} move-me.mobi falhou para pattern ${pattern.id}, a usar OTP:`, err.message);
+          return fetchPatternTrips(pattern.id);
+        }
+      }),
       GRAPHQL_MAX_CONCURRENT,
     );
 
