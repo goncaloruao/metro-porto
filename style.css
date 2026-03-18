@@ -107,7 +107,58 @@ body {
   margin-bottom: 8px;
 }
 
+/* Subtítulo de subsecção (Metro / STCP) */
+.subsection-title {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #5a6a7a;
+  margin: 10px 0 5px;
+}
+
+/* ── Toggles de camadas ────────────────────────────────────── */
+.toggle-row {
+  display: flex;
+  gap: 8px;
+}
+
+.layer-toggle {
+  flex: 1;
+  padding: 7px 4px;
+  border-radius: 8px;
+  border: 1px solid #1a4a8a;
+  background: #1e2d4a;
+  color: #e0e0e0;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+}
+
+.layer-toggle:hover {
+  background: #2a3d5e;
+}
+
+.layer-toggle.off {
+  opacity: 0.35;
+  background: #131d30;
+}
+
+/* Mensagem sem veículos activos */
+.no-vehicles {
+  font-size: 0.78rem;
+  color: #5a6a7a;
+  text-align: center;
+  padding: 6px 0;
+}
+
 #active-trains {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#active-buses {
   display: flex;
   flex-direction: column;
   gap: 6px;

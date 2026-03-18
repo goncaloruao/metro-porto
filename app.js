@@ -20,6 +20,15 @@ const SECONDS_PER_DAY = 86400;
 /** Segundos numa hora */
 const SECONDS_PER_HOUR = 3600;
 
+/** Cor dos marcadores e polylines STCP (laranja-avermelhado) */
+const BUS_COLOR = '#e85d04';
+
+/** Número máximo de rotas STCP a processar por ciclo */
+const MAX_BUS_ROUTES = 30;
+
+/** Pausa entre pedidos de pattern STCP para não sobrecarregar a API (ms) */
+const BUS_PATTERN_DELAY_MS = 50;
+
 /**
  * Cores oficiais das linhas do Metro do Porto.
  * Chave = shortName da rota (ex: "A", "B", …)
@@ -61,8 +70,23 @@ let map;
 /** Marcadores activos no mapa (comboios) — Map<tripId, marker> */
 const trainMarkers = new Map();
 
+/** Marcadores activos no mapa (autocarros STCP) — Map<tripId, {marker, popup, el}> */
+const busMarkers = new Map();
+
 /** Marcadores das paragens no mapa */
 const stopMarkers = [];
+
+/** IDs das camadas MapLibre do metro (para toggle) */
+const metroLayerIds = [];
+
+/** IDs das camadas MapLibre do STCP (para toggle) */
+const busLayerIds = [];
+
+/** Visibilidade actual da camada metro */
+let metroVisible = true;
+
+/** Visibilidade actual da camada STCP */
+let busVisible = true;
 
 /** Popup actualmente aberto */
 let activePopup = null;
@@ -172,6 +196,42 @@ async function fetchPatternTrips(patternId) {
     }
   }`);
   return data.pattern;
+}
+
+/**
+ * Pausa a execução durante `ms` milissegundos.
+ * Usada entre pedidos de pattern STCP para não sobrecarregar a API.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Obtém as rotas de autocarro STCP e os respectivos padrões com paragens.
+ * @returns {Promise<Array>}
+ */
+async function fetchBusRoutes() {
+  const data = await graphql(`{
+    routes(transportModes: [{transportMode: BUS}]) {
+      id
+      shortName
+      longName
+      patterns {
+        id
+        headsign
+        directionId
+        stops {
+          id
+          name
+          lat
+          lon
+        }
+      }
+    }
+  }`);
+  return data.routes;
 }
 
 // ── Lógica de interpolação ──────────────────────────────────────────────────
@@ -285,6 +345,9 @@ function drawLines(routes) {
           'line-opacity': 0.85,
         },
       });
+
+      // Registar o ID da camada para o toggle do metro
+      metroLayerIds.push(layerId);
     });
   });
 }
@@ -431,6 +494,146 @@ function removeStaleMarkers(activeTripIds) {
   }
 }
 
+/**
+ * Desenha as polylines das rotas STCP no mapa.
+ * Linhas finas e semitransparentes para não obscurecer o metro.
+ * @param {Array} routes  Lista de rotas STCP
+ */
+function drawBusLines(routes) {
+  routes.forEach(route => {
+    route.patterns.forEach(pattern => {
+      const coords = pattern.stops.map(s => [s.lon, s.lat]);
+      if (coords.length < 2) return;
+
+      const sourceId = `bus-src-${pattern.id}`;
+      const layerId  = `bus-lyr-${pattern.id}`;
+
+      if (map.getSource(sourceId)) return;
+
+      map.addSource(sourceId, {
+        type: 'geojson',
+        data: {
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: coords },
+        },
+      });
+
+      map.addLayer({
+        id: layerId,
+        type: 'line',
+        source: sourceId,
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: {
+          'line-color': BUS_COLOR,
+          'line-width': 1.5,
+          'line-opacity': 0.3,
+        },
+      });
+
+      // Registar o ID da camada para o toggle STCP
+      busLayerIds.push(layerId);
+    });
+  });
+}
+
+/**
+ * Cria ou actualiza um marcador de autocarro STCP no mapa.
+ * Os marcadores são quadrados (para distinguir dos círculos do metro).
+ *
+ * @param {string} tripId    ID único da trip (com prefixo "bus-")
+ * @param {object} pos       Objecto de posição (lat, lon, fraction, …)
+ * @param {string} lineName  Número da linha STCP (shortName)
+ * @param {string} headsign  Destino/cabeçalho
+ * @param {string} fromStop  Primeira paragem da rota
+ * @param {string} toStop    Última paragem da rota
+ */
+function upsertBusMarker(tripId, pos, lineName, headsign, fromStop, toStop) {
+  // Marcador quadrado (distinto dos círculos redondos dos metros)
+  const el = document.createElement('div');
+  el.style.cssText = [
+    `background:${BUS_COLOR}`,
+    'width:18px', 'height:18px', 'border-radius:3px',
+    'border:2px solid rgba(255,255,255,0.4)',
+    'cursor:pointer',
+    'display:flex', 'align-items:center', 'justify-content:center',
+    'color:#fff', 'font-size:7px', 'font-weight:800',
+    'box-shadow:0 2px 6px rgba(0,0,0,0.5)',
+    'overflow:hidden', 'white-space:nowrap',
+  ].join(';');
+  // Mostrar número da linha (máx. 4 caracteres para linhas STCP tipo "200")
+  el.textContent = lineName.slice(0, 4);
+  el.title = `STCP ${lineName} → ${headsign}`;
+
+  const progressPct = Math.round(pos.fraction * 100);
+  const arrivalStr  = pos.arrivesInSec < 60
+    ? '&lt; 1 min'
+    : `~${Math.round(pos.arrivesInSec / 60)} min`;
+
+  const popupHtml = `
+    <div class="popup-line">
+      <div class="popup-line-badge" style="background:${BUS_COLOR};color:#fff;border-radius:3px;">🚌</div>
+      <span class="popup-line-name">STCP — Linha ${lineName}</span>
+    </div>
+    <p class="popup-headsign">→ ${headsign}</p>
+    <p class="popup-stops">
+      <strong>${fromStop}</strong> → <strong>${toStop}</strong>
+    </p>
+    <p class="popup-stops" style="font-size:0.73rem;color:#8a9aaa;">
+      ↳ ${pos.fromStop} → ${pos.toStop}
+    </p>
+    <div class="popup-progress-bar-wrap">
+      <div class="popup-progress-bar" style="width:${progressPct}%;background:${BUS_COLOR};"></div>
+    </div>
+    <p class="popup-info">
+      Progresso: ${progressPct}%<br>
+      Chegada à próxima paragem: ${arrivalStr}
+    </p>
+  `;
+
+  if (busMarkers.has(tripId)) {
+    // Actualizar posição e conteúdo do marcador existente
+    const existing = busMarkers.get(tripId);
+    existing.marker.setLngLat([pos.lon, pos.lat]);
+    existing.popup.setHTML(popupHtml);
+    existing.el.style.cssText = el.style.cssText;
+    existing.el.textContent = el.textContent;
+  } else {
+    // Criar novo marcador
+    const popup = new maplibregl.Popup({ offset: 12, closeButton: true })
+      .setHTML(popupHtml);
+
+    const marker = new maplibregl.Marker({ element: el })
+      .setLngLat([pos.lon, pos.lat])
+      .setPopup(popup)
+      .addTo(map);
+
+    el.addEventListener('click', () => {
+      if (activePopup && activePopup !== popup) activePopup.remove();
+      activePopup = popup;
+    });
+
+    // Respeitar a visibilidade actual da camada STCP
+    if (!busVisible) {
+      marker.getElement().style.display = 'none';
+    }
+
+    busMarkers.set(tripId, { marker, popup, el });
+  }
+}
+
+/**
+ * Remove marcadores de autocarros de trips que já não estão activas.
+ * @param {Set<string>} activeBusTripIds
+ */
+function removeStaleBusMarkers(activeBusTripIds) {
+  for (const [tripId, { marker }] of busMarkers) {
+    if (!activeBusTripIds.has(tripId)) {
+      marker.remove();
+      busMarkers.delete(tripId);
+    }
+  }
+}
+
 // ── Sidebar ──────────────────────────────────────────────────────────────────
 
 /**
@@ -481,6 +684,97 @@ function updateLastUpdated() {
   el.textContent = `Actualizado: ${new Date().toLocaleTimeString('pt-PT')}`;
 }
 
+/**
+ * Actualiza a secção STCP na sidebar com o total de autocarros activos
+ * e as 5 linhas mais activas.
+ * @param {object} countsByLine  { "200": 3, "201": 1, … }
+ */
+function updateActiveBusStats(countsByLine) {
+  const el = document.getElementById('active-buses');
+  if (!el) return;
+  el.innerHTML = '';
+
+  const total = Object.values(countsByLine).reduce((a, b) => a + b, 0);
+
+  if (total === 0) {
+    el.insertAdjacentHTML('beforeend', '<p class="no-vehicles">Sem autocarros activos</p>');
+    return;
+  }
+
+  // Total de autocarros activos
+  el.insertAdjacentHTML('beforeend', `
+    <div class="line-count">
+      <div class="line-badge" style="background:${BUS_COLOR};color:#fff;border-radius:4px;font-size:0.7rem;">🚌</div>
+      <span class="line-label">Total STCP</span>
+      <span class="count-badge active">${total}</span>
+    </div>
+  `);
+
+  // Top 5 linhas mais activas (decrescente)
+  const top5 = Object.entries(countsByLine)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
+
+  top5.forEach(([line, count]) => {
+    el.insertAdjacentHTML('beforeend', `
+      <div class="line-count">
+        <div class="line-badge" style="background:${BUS_COLOR};color:#fff;border-radius:4px;font-size:0.7rem;">${line}</div>
+        <span class="line-label">Linha ${line}</span>
+        <span class="count-badge active">${count}</span>
+      </div>
+    `);
+  });
+}
+
+/**
+ * Alterna a visibilidade da camada do Metro (linhas, paragens e comboios).
+ */
+function toggleMetroLayer() {
+  metroVisible = !metroVisible;
+
+  // Toggle das polylines do metro
+  metroLayerIds.forEach(id => {
+    if (map.getLayer(id)) {
+      map.setLayoutProperty(id, 'visibility', metroVisible ? 'visible' : 'none');
+    }
+  });
+
+  // Toggle dos marcadores de comboios
+  trainMarkers.forEach(({ marker }) => {
+    marker.getElement().style.display = metroVisible ? '' : 'none';
+  });
+
+  // Toggle dos marcadores de paragens
+  stopMarkers.forEach(m => {
+    m.getElement().style.display = metroVisible ? '' : 'none';
+  });
+
+  // Actualizar estado visual do botão
+  document.getElementById('toggle-metro').classList.toggle('off', !metroVisible);
+}
+
+/**
+ * Alterna a visibilidade da camada STCP (polylines e marcadores de autocarros).
+ */
+function toggleBusLayer() {
+  busVisible = !busVisible;
+
+  // Toggle das polylines STCP
+  busLayerIds.forEach(id => {
+    if (map.getLayer(id)) {
+      map.setLayoutProperty(id, 'visibility', busVisible ? 'visible' : 'none');
+    }
+  });
+
+  // Toggle dos marcadores de autocarros
+  busMarkers.forEach(({ marker }) => {
+    marker.getElement().style.display = busVisible ? '' : 'none';
+  });
+
+  // Actualizar estado visual do botão
+  document.getElementById('toggle-stcp').classList.toggle('off', !busVisible);
+}
+
 // ── Controlo do UI ───────────────────────────────────────────────────────────
 
 function showLoading(msg = 'A carregar dados do Metro do Porto…') {
@@ -505,13 +799,91 @@ function showError(msg) {
  * Variável global que guarda os dados das rotas/paragens para não os
  * re-pedir em cada actualização (apenas os trips é que mudam frequentemente).
  */
-let cachedRoutes = null;
-let linesDrawn   = false;
+let cachedRoutes    = null;
+let linesDrawn      = false;
+
+/** Cache das rotas STCP (as primeiras MAX_BUS_ROUTES por shortName) */
+let cachedBusRoutes = null;
+
+/** Flag para garantir que as polylines STCP são desenhadas apenas uma vez */
+let busLinesDrawn   = false;
 
 /**
- * Carrega todos os dados do Metro do Porto, calcula posições estimadas
- * e actualiza o mapa.
+ * Carrega as rotas e posições estimadas dos autocarros STCP.
+ * Limita-se às primeiras MAX_BUS_ROUTES rotas (ordenadas por shortName).
+ * Os pedidos de pattern são feitos sequencialmente com uma pequena pausa
+ * entre cada um para não sobrecarregar a API.
  */
+async function loadSTCPBuses() {
+  // ── 1. Rotas STCP (cache após primeira chamada) ──────────────────────────
+  if (!cachedBusRoutes) {
+    showLoading('A carregar rotas STCP…');
+    const allBusRoutes = await fetchBusRoutes();
+
+    // Ordenar por shortName (numérico) e limitar às primeiras MAX_BUS_ROUTES
+    allBusRoutes.sort((a, b) =>
+      a.shortName.localeCompare(b.shortName, 'pt', { numeric: true })
+    );
+    cachedBusRoutes = allBusRoutes.slice(0, MAX_BUS_ROUTES);
+  }
+
+  // ── 2. Desenhar polylines das rotas STCP (apenas uma vez) ───────────────
+  if (!busLinesDrawn) {
+    drawBusLines(cachedBusRoutes);
+    busLinesDrawn = true;
+    hideLoading();
+  }
+
+  // ── 3. Calcular posições estimadas por trip activa ───────────────────────
+  const nowSec          = secondsSinceMidnight();
+  const activeBusTripIds = new Set();
+  const countsByLine    = {};
+
+  for (const route of cachedBusRoutes) {
+    for (const pattern of route.patterns) {
+      try {
+        const patternData = await fetchPatternTrips(pattern.id);
+        if (!patternData) continue;
+
+        const lineName = route.shortName;
+        if (!countsByLine[lineName]) countsByLine[lineName] = 0;
+
+        // Paragens extremas do pattern (origem e destino da rota)
+        const fromStop = pattern.stops?.[0]?.name || '—';
+        const toStop   = pattern.stops?.[pattern.stops.length - 1]?.name || '—';
+
+        patternData.trips.forEach(trip => {
+          if (!trip.stoptimes || trip.stoptimes.length < 2) return;
+
+          const pos = estimateTripPosition(trip.stoptimes, nowSec);
+          if (!pos) return; // trip não está activa agora
+
+          // Prefixo "bus-" para evitar colisões com IDs de trips do metro
+          const tripId  = `bus-${trip.id}`;
+          const headsign = trip.tripHeadsign || pattern.headsign || '—';
+
+          activeBusTripIds.add(tripId);
+          countsByLine[lineName]++;
+
+          upsertBusMarker(tripId, pos, lineName, headsign, fromStop, toStop);
+        });
+      } catch (err) {
+        console.warn(`[STCP] Erro ao carregar pattern ${pattern.id}:`, err);
+      }
+
+      // Pequena pausa após cada pedido para não sobrecarregar a API
+      await delay(BUS_PATTERN_DELAY_MS);
+    }
+  }
+
+  // ── 4. Remover marcadores de trips que terminaram ────────────────────────
+  removeStaleBusMarkers(activeBusTripIds);
+
+  // ── 5. Actualizar secção STCP na sidebar ─────────────────────────────────
+  updateActiveBusStats(countsByLine);
+}
+
+
 async function loadAndRender() {
   if (isLoading) return;
   isLoading = true;
@@ -582,9 +954,14 @@ async function loadAndRender() {
     // ── 4. Remover marcadores de trips que terminaram ────────────────────────
     removeStaleMarkers(activeTripIds);
 
-    // ── 5. Actualizar sidebar ────────────────────────────────────────────────
+    // ── 5. Actualizar sidebar do metro ───────────────────────────────────────
     updateActiveTrainCounts(countsByLine);
     updateLastUpdated();
+    hideLoading();
+
+    // ── 6. Carregar dados STCP em segundo plano ──────────────────────────────
+    //      (sem bloquear a UI — usa o mesmo ciclo de actualização)
+    await loadSTCPBuses();
 
   } catch (err) {
     console.error('[MetroPorto] Erro ao carregar dados:', err);
@@ -648,6 +1025,10 @@ function init() {
     clearTimeout(refreshTimeout);
     loadAndRender();
   });
+
+  // Botões de toggle de camadas
+  document.getElementById('toggle-metro').addEventListener('click', toggleMetroLayer);
+  document.getElementById('toggle-stcp').addEventListener('click', toggleBusLayer);
 
   // Inicializar mapa
   initMap();
