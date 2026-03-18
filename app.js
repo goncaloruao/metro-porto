@@ -50,6 +50,18 @@ const MAX_BUS_ROUTES = 30;
 /** Pausa entre pedidos de pattern STCP para não sobrecarregar a API (ms) */
 const BUS_PATTERN_DELAY_MS = 50;
 
+/** Endpoint da API move-me.mobi para dados de próximas partidas */
+const MOVEME_BASE_URL = 'https://move-me.mobi';
+
+/** Chave de acesso à API move-me.mobi */
+const MOVEME_API_KEY = 'C00Z8SHC8WSS0-MN';
+
+/** Nome do operador Metro do Porto na API move-me.mobi */
+const MOVEME_METRO_OPERATOR = 'METRO DO PORTO';
+
+/** Tempo médio estimado entre paragens consecutivas do Metro do Porto (segundos) */
+const MOVEME_AVG_INTER_STOP_SEC = 150;
+
 /**
  * Cores oficiais das linhas do Metro do Porto.
  * Chave = shortName da rota (ex: "A", "B", …)
@@ -296,18 +308,24 @@ function loadStaleRoutesFromCache() {
 
 /**
  * Obtém todas as rotas de metro e os respectivos padrões (patterns) com paragens.
+ * O filtro por modo é feito no cliente para evitar dependência do argumento
+ * `transportModes` do servidor OTP, que tem variado entre versões.
  * @returns {Promise<Array>}
  */
 async function fetchRoutesAndPatterns() {
   const data = await graphql(`{
-    routes(transportModes: [SUBWAY]) {
+    routes {
       id
       shortName
       longName
+      mode
       patterns {
         id
         headsign
         directionId
+        patternGeometry {
+          points
+        }
         stops {
           id
           name
@@ -317,7 +335,7 @@ async function fetchRoutesAndPatterns() {
       }
     }
   }`);
-  return data.routes;
+  return data.routes.filter(r => r.mode === 'SUBWAY');
 }
 
 /**
@@ -366,14 +384,16 @@ function delay(ms) {
 
 /**
  * Obtém as rotas de autocarro STCP e os respectivos padrões com paragens.
+ * O filtro por modo é feito no cliente (ver fetchRoutesAndPatterns).
  * @returns {Promise<Array>}
  */
 async function fetchBusRoutes() {
   const data = await graphql(`{
-    routes(transportModes: [BUS]) {
+    routes {
       id
       shortName
       longName
+      mode
       patterns {
         id
         headsign
@@ -387,10 +407,412 @@ async function fetchBusRoutes() {
       }
     }
   }`);
-  return data.routes;
+  return data.routes.filter(r => r.mode === 'BUS');
 }
 
-// ── Lógica de interpolação ──────────────────────────────────────────────────
+// ── Geometria de rota ────────────────────────────────────────────────────────
+// Adaptado de https://github.com/Cabeda/porto-realtime/blob/main/lib/simulate.ts
+
+/** Velocidade média estimada do Metro do Porto entre paragens (m/s ≈ 18 km/h) */
+const METRO_SPEED_MPS = 5.0;
+
+/**
+ * Distância em metros entre dois pontos geográficos (fórmula de Haversine).
+ */
+function haversineM(lat1, lon1, lat2, lon2) {
+  const R = 6_371_000;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+    Math.cos((lat2 * Math.PI) / 180) *
+    Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/**
+ * Rumo em graus (0–360) de A → B.
+ */
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const y = Math.sin(dLon) * Math.cos((lat2 * Math.PI) / 180);
+  const x =
+    Math.cos((lat1 * Math.PI) / 180) * Math.sin((lat2 * Math.PI) / 180) -
+    Math.sin((lat1 * Math.PI) / 180) *
+    Math.cos((lat2 * Math.PI) / 180) *
+    Math.cos(dLon);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+/**
+ * Descodifica uma polyline codificada no formato Google/OTP (precisão 1e-5).
+ * Devolve array de [lat, lon] em graus decimais.
+ * @param {string} encoded
+ * @returns {Array<[number, number]>}
+ */
+function decodePolyline(encoded) {
+  const coords = [];
+  let index = 0, lat = 0, lon = 0;
+  while (index < encoded.length) {
+    let shift = 0, result = 0, byte;
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift  += 5;
+    } while (byte >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+    shift = 0; result = 0;
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift  += 5;
+    } while (byte >= 0x20);
+    lon += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+    coords.push([lat / 1e5, lon / 1e5]);
+  }
+  return coords;
+}
+
+/**
+ * Calcula o array de distâncias cumulativas (em metros) ao longo de uma polyline.
+ * @param {Array<[number, number]>} coords  Array de [lat, lon]
+ * @returns {number[]}
+ */
+function buildCumDist(coords) {
+  const cumDist = [0];
+  for (let i = 1; i < coords.length; i++) {
+    cumDist.push(
+      cumDist[i - 1] + haversineM(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1])
+    );
+  }
+  return cumDist;
+}
+
+/**
+ * Projecta uma paragem (lat, lon) na polyline mais próxima e devolve a
+ * distância cumulativa (metros) ao longo da rota nesse ponto.
+ * Usa aproximação de terra-plana para o produto interno (adequada para <50 km).
+ * @param {number} stopLat
+ * @param {number} stopLon
+ * @param {Array<[number, number]>} coords
+ * @param {number[]} cumDist
+ * @returns {number}
+ */
+function projectStopOnRoute(stopLat, stopLon, coords, cumDist) {
+  const LAT_M = 111_320;
+  let bestDist = Infinity;
+  let bestCumDist = 0;
+
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [lat1, lon1] = coords[i];
+    const [lat2, lon2] = coords[i + 1];
+    const cosLat = Math.cos((lat1 * Math.PI) / 180);
+    const LON_M = LAT_M * cosLat;
+
+    const bx = (lat2 - lat1) * LAT_M;
+    const by = (lon2 - lon1) * LON_M;
+    const px = (stopLat - lat1) * LAT_M;
+    const py = (stopLon - lon1) * LON_M;
+
+    const segLenSq = bx * bx + by * by;
+    const t = segLenSq > 0 ? Math.max(0, Math.min(1, (px * bx + py * by) / segLenSq)) : 0;
+
+    const closestLat = lat1 + t * (lat2 - lat1);
+    const closestLon = lon1 + t * (lon2 - lon1);
+    const d = haversineM(stopLat, stopLon, closestLat, closestLon);
+
+    if (d < bestDist) {
+      bestDist = d;
+      bestCumDist = cumDist[i] + t * (cumDist[i + 1] - cumDist[i]);
+    }
+  }
+  return bestCumDist;
+}
+
+/**
+ * Dado um array de coords + distâncias cumulativas e uma distância-alvo,
+ * devolve {lat, lon, heading} interpolando ao longo da polyline.
+ * @param {Array<[number, number]>} coords
+ * @param {number[]} cumDist
+ * @param {number} targetDist  metros desde o início
+ * @returns {{lat: number, lon: number, heading: number}}
+ */
+function positionOnRoute(coords, cumDist, targetDist) {
+  const n = coords.length;
+  if (targetDist <= 0) {
+    return { lat: coords[0][0], lon: coords[0][1], heading: bearingDeg(coords[0][0], coords[0][1], coords[1][0], coords[1][1]) };
+  }
+  if (targetDist >= cumDist[n - 1]) {
+    return { lat: coords[n - 1][0], lon: coords[n - 1][1], heading: bearingDeg(coords[n - 2][0], coords[n - 2][1], coords[n - 1][0], coords[n - 1][1]) };
+  }
+  // Binary search for the segment containing targetDist
+  let lo = 0, hi = n - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (cumDist[mid] <= targetDist) lo = mid; else hi = mid;
+  }
+  const segLen = cumDist[hi] - cumDist[lo];
+  const t = segLen > 0 ? (targetDist - cumDist[lo]) / segLen : 0;
+  const [lat1, lon1] = coords[lo];
+  const [lat2, lon2] = coords[hi];
+  return {
+    lat: lat1 + (lat2 - lat1) * t,
+    lon: lon1 + (lon2 - lon1) * t,
+    heading: bearingDeg(lat1, lon1, lat2, lon2),
+  };
+}
+
+// ── API move-me.mobi ─────────────────────────────────────────────────────────
+
+/**
+ * Extrai o identificador numérico de uma paragem a partir do ID GTFS do OTP.
+ * Ex: "portopt:169223" → "169223", "1:169223" → "169223"
+ * @param {string} otpId
+ * @returns {string}
+ */
+function otpStopNumericId(otpId) {
+  return otpId.split(':').pop();
+}
+
+/**
+ * Obtém as próximas partidas para uma paragem do Metro do Porto via move-me.mobi.
+ * @param {string} numericStopId  ID numérico da paragem (ex: "169223")
+ * @returns {Promise<Array>}  Array de objectos de partida
+ */
+async function fetchStopDepartures(numericStopId) {
+  const operator = encodeURIComponent(MOVEME_METRO_OPERATOR);
+  const url = `${MOVEME_BASE_URL}/stop/${operator}/${numericStopId}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GRAPHQL_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'apikey': MOVEME_API_KEY,
+        'Accept': '*/*',
+        'Content-Type': 'application/json; charset=utf-8',
+        'Referer': 'https://move-me.mobi/next-departures',
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+/**
+ * Determina qual das direcções do move-me.mobi (1 ou 2) corresponde ao sentido
+ * do pattern OTP, comparando os valores de `order` da primeira e última paragem.
+ * A direcção correcta é aquela em que `order` da primeira paragem < `order` da última.
+ * @param {Array}  patternStops  Paragens do pattern OTP (ordenadas)
+ * @param {Map}    stopDepsMap   Mapa numericId → Array<departure>
+ * @returns {number|null}  1, 2 ou null se não for possível determinar
+ */
+function detectPatternDirection(patternStops, stopDepsMap) {
+  if (patternStops.length < 2) return null;
+
+  const firstId = otpStopNumericId(patternStops[0].id);
+  const lastId  = otpStopNumericId(patternStops[patternStops.length - 1].id);
+
+  const firstDeps = stopDepsMap.get(firstId) || [];
+  const lastDeps  = stopDepsMap.get(lastId)  || [];
+
+  for (const dir of [1, 2]) {
+    const firstOrders = firstDeps.filter(d => d.direction === dir).map(d => d.order);
+    const lastOrders  = lastDeps.filter(d => d.direction === dir).map(d => d.order);
+
+    if (!firstOrders.length || !lastOrders.length) continue;
+
+    const avgFirst = firstOrders.reduce((a, b) => a + b, 0) / firstOrders.length;
+    const avgLast  = lastOrders.reduce((a, b) => a + b, 0) / lastOrders.length;
+
+    if (avgFirst < avgLast) return dir;
+  }
+  return null; // não foi possível determinar; incluir todas as direcções
+}
+
+/**
+ * Obtém dados de viagens para um pattern do Metro usando a API move-me.mobi.
+ * Substitui fetchPatternTrips para as rotas do metro.
+ *
+ * Se o pattern tiver `patternGeometry.points` (polyline OTP), usa geometria real
+ * para calcular a posição exacta do comboio na via (método de Cabeda/porto-realtime).
+ * Caso contrário, recorre à interpolação linear entre paragens (fallback).
+ *
+ * Algoritmo geométrico:
+ *  1. Descodifica a polyline da rota e projecta cada paragem nela.
+ *  2. Obtém partidas move-me.mobi para todas as paragens.
+ *  3. Para cada trip: calcula posição actual = cumDist(nextStop) − duration × speed.
+ *  4. Devolve `directPos` com lat/lon/heading exactos + metadados para o popup.
+ *
+ * @param {object} pattern  Pattern do OTP (com array stops e patternGeometry opcional)
+ * @returns {Promise<object>}  { trips: [{id, tripHeadsign, stoptimes?, directPos?}] }
+ */
+async function fetchPatternTripsMoveMe(pattern) {
+  const nowSec = secondsSinceMidnight();
+
+  // ── Preparar geometria da rota (se disponível) ────────────────────────────
+  let coords        = null;
+  let cumDist       = null;
+  let stopCumDists  = null; // Map<stopId, cumDist em metros>
+
+  if (pattern.patternGeometry?.points) {
+    try {
+      coords = decodePolyline(pattern.patternGeometry.points);
+      if (coords.length >= 2) {
+        cumDist      = buildCumDist(coords);
+        stopCumDists = new Map();
+        for (const stop of pattern.stops) {
+          stopCumDists.set(stop.id, projectStopOnRoute(stop.lat, stop.lon, coords, cumDist));
+        }
+      }
+    } catch (geoErr) {
+      console.warn(`${LOG_PREFIX} Erro ao processar geometria do pattern ${pattern.id}:`, geoErr.message);
+      coords = null; cumDist = null; stopCumDists = null;
+    }
+  }
+
+  // ── 1. Obter partidas para todas as paragens do pattern em paralelo ────────
+  const stopResults = await runConcurrent(
+    pattern.stops.map(stop => async () => {
+      const numId = otpStopNumericId(stop.id);
+      const deps  = await fetchStopDepartures(numId).catch(() => []);
+      return { stop, deps: Array.isArray(deps) ? deps : [] };
+    }),
+    GRAPHQL_MAX_CONCURRENT,
+  );
+
+  const stopDepsMap = new Map();
+  const fulfilled   = [];
+  for (const result of stopResults) {
+    if (result.status !== 'fulfilled') continue;
+    const { stop, deps } = result.value;
+    fulfilled.push({ stop, deps });
+    stopDepsMap.set(otpStopNumericId(stop.id), deps);
+  }
+
+  // ── 2. Detectar direcção move-me que corresponde a este pattern OTP ────────
+  const direction = detectPatternDirection(pattern.stops, stopDepsMap);
+
+  // ── 3. Agrupar partidas por tripId ─────────────────────────────────────────
+  const tripMap = new Map(); // tripId → { headsign, entries[] }
+
+  for (const { stop, deps } of fulfilled) {
+    const filtered = direction != null ? deps.filter(d => d.direction === direction) : deps;
+    for (const dep of filtered) {
+      const key = String(dep.tripId);
+      if (!tripMap.has(key)) tripMap.set(key, { headsign: dep.destination, entries: [] });
+      tripMap.get(key).entries.push({
+        order:       dep.order,
+        stop,
+        arrivalSec:  nowSec + dep.duration * 60,
+        durationSec: dep.duration * 60,
+        isRT:        dep.isRT,
+      });
+    }
+  }
+
+  // ── 4. Construir trips ─────────────────────────────────────────────────────
+  const trips = [];
+
+  for (const [tripId, tripData] of tripMap) {
+    tripData.entries.sort((a, b) => a.order - b.order);
+    const upcoming = tripData.entries.filter(e => e.arrivalSec > nowSec);
+    if (!upcoming.length) continue;
+
+    // ── Abordagem geométrica (polyline disponível) ───────────────────────────
+    if (coords && cumDist && stopCumDists) {
+      const nextEntry  = upcoming[0];
+      const nextStop   = nextEntry.stop;
+      const nextCumD   = stopCumDists.get(nextStop.id) ?? 0;
+      const nextDurSec = nextEntry.durationSec;
+
+      // Estimar velocidade: se tivermos 2 paragens consecutivas usamos dados reais
+      let speedMps = METRO_SPEED_MPS;
+      if (upcoming.length >= 2) {
+        const e2  = upcoming[1];
+        const cd2 = stopCumDists.get(e2.stop.id) ?? nextCumD;
+        const dt  = e2.durationSec - nextDurSec;
+        if (dt > 0 && cd2 > nextCumD) speedMps = (cd2 - nextCumD) / dt;
+      }
+
+      // Posição actual do comboio ao longo da polyline da rota
+      const trainCumD = Math.max(0, nextCumD - nextDurSec * speedMps);
+      const pos       = positionOnRoute(coords, cumDist, trainCumD);
+
+      // Paragem anterior para o campo fromStop e a barra de progresso
+      const prevIdx  = Math.max(0, nextEntry.order - 2);
+      const prevStop = pattern.stops[prevIdx] || pattern.stops[0];
+      const prevCumD = stopCumDists.get(prevStop.id) ??
+                       Math.max(0, nextCumD - MOVEME_AVG_INTER_STOP_SEC * speedMps);
+
+      const segLen   = Math.max(1, nextCumD - prevCumD);
+      const fraction = Math.min(1, Math.max(0, (trainCumD - prevCumD) / segLen));
+
+      trips.push({
+        id:           tripId,
+        tripHeadsign: tripData.headsign,
+        stoptimes:    [],           // não usado quando directPos está definido
+        directPos: {
+          lat:         pos.lat,
+          lon:         pos.lon,
+          heading:     pos.heading,
+          fraction,
+          fromStop:    prevStop.name,
+          toStop:      nextStop.name,
+          arrivesInSec: Math.round(nextDurSec),
+          arrivalTime: secsToHHMM(nextEntry.arrivalSec),
+          realtime:    nextEntry.isRT,
+        },
+      });
+      continue;
+    }
+
+    // ── Fallback: interpolação linear stop-a-stop (sem polyline) ─────────────
+    const stoptimes = upcoming.map(e => ({
+      stop:               { id: e.stop.id, name: e.stop.name, lat: e.stop.lat, lon: e.stop.lon },
+      scheduledArrival:   e.arrivalSec,
+      scheduledDeparture: e.arrivalSec,
+      realtimeArrival:    e.arrivalSec,
+      realtimeDeparture:  e.arrivalSec,
+      realtime:           e.isRT,
+    }));
+
+    const firstEntry = upcoming[0];
+    if (firstEntry.order > 1) {
+      let interStopSec = MOVEME_AVG_INTER_STOP_SEC;
+      if (upcoming.length >= 2) {
+        const timeSpan  = upcoming[upcoming.length - 1].arrivalSec - upcoming[0].arrivalSec;
+        const orderSpan = upcoming[upcoming.length - 1].order     - upcoming[0].order;
+        if (orderSpan > 0) interStopSec = Math.max(30, timeSpan / orderSpan);
+      }
+      const prevIdx  = Math.max(0, firstEntry.order - 2);
+      const prevStop = pattern.stops[prevIdx] || pattern.stops[0];
+      const prevArr  = stoptimes[0].scheduledArrival - interStopSec;
+      stoptimes.unshift({
+        stop:               { id: prevStop.id, name: prevStop.name, lat: prevStop.lat, lon: prevStop.lon },
+        scheduledArrival:   prevArr,
+        scheduledDeparture: prevArr,
+        realtimeArrival:    prevArr,
+        realtimeDeparture:  prevArr,
+        realtime:           stoptimes[0].realtime,
+      });
+    }
+
+    if (stoptimes.length >= 2) {
+      trips.push({ id: tripId, tripHeadsign: tripData.headsign, stoptimes });
+    }
+  }
+
+  return { trips };
+}
+
 
 /**
  * Calcula a posição estimada de um comboio entre duas paragens,
@@ -1097,7 +1519,14 @@ async function loadAndRender() {
     );
 
     const results = await runConcurrent(
-      patternFetches.map(({ pattern }) => () => fetchPatternTrips(pattern.id)),
+      patternFetches.map(({ pattern }) => async () => {
+        try {
+          return await fetchPatternTripsMoveMe(pattern);
+        } catch (err) {
+          console.warn(`${LOG_PREFIX} move-me.mobi falhou para pattern ${pattern.id}, a usar OTP:`, err.message);
+          return fetchPatternTrips(pattern.id);
+        }
+      }),
       GRAPHQL_MAX_CONCURRENT,
     );
 
@@ -1121,9 +1550,10 @@ async function loadAndRender() {
       if (!countsByLine[lineName]) countsByLine[lineName] = 0;
 
       patternData.trips.forEach(trip => {
-        if (!trip.stoptimes || trip.stoptimes.length < 2) return;
-
-        const pos = estimateTripPosition(trip.stoptimes, nowSec);
+        // directPos: calculado pela abordagem geométrica (move-me.mobi + polyline)
+        // estimateTripPosition: fallback para OTP stoptimes
+        const pos = trip.directPos ||
+          (trip.stoptimes?.length >= 2 ? estimateTripPosition(trip.stoptimes, nowSec) : null);
         if (!pos) return; // trip não está activa agora
 
         const tripId   = trip.id;
