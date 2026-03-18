@@ -20,6 +20,15 @@ const GRAPHQL_MAX_RETRIES = 2;
 /** Atraso base entre tentativas (ms); dobra a cada retry */
 const GRAPHQL_RETRY_DELAY_MS = 1500;
 
+/** Tempo máximo de espera por uma resposta da API (ms) antes de abortar */
+const GRAPHQL_FETCH_TIMEOUT_MS = 30_000;
+
+/** Número máximo de pedidos de pattern do metro em simultâneo */
+const GRAPHQL_MAX_CONCURRENT = 4;
+
+/** Prefixo de log para todas as mensagens da aplicação */
+const LOG_PREFIX = '[MetroPorto]';
+
 /** Chave de armazenamento localStorage para as rotas/paragens */
 const CACHE_KEY_ROUTES = 'metroPorto_routes_v1';
 
@@ -136,29 +145,61 @@ function secsToHHMM(secs) {
 /**
  * Executa uma query GraphQL via POST, com retentativas automáticas
  * em caso de erro de servidor (5xx) ou falha de rede.
+ * Suporta variáveis GraphQL para evitar interpolação directa de strings.
  * @param {string} query
+ * @param {object} [variables={}]
  * @returns {Promise<object>}
  */
-async function graphql(query) {
+async function graphql(query, variables = {}) {
   let lastError;
 
   for (let attempt = 0; attempt <= GRAPHQL_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GRAPHQL_FETCH_TIMEOUT_MS);
+
     try {
       const res = await fetch(GRAPHQL_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, variables }),
+        signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.error(
+          `${LOG_PREFIX} API devolveu HTTP ${res.status}`,
+          { url: GRAPHQL_URL, status: res.status, body: body.slice(0, 500) },
+        );
+        throw new Error(`HTTP ${res.status}`);
+      }
+
       const json = await res.json();
-      if (json.errors) throw new Error(json.errors.map(e => e.message).join('; '));
+      if (json.errors) {
+        console.error(`${LOG_PREFIX} Erros GraphQL:`, json.errors);
+        throw new Error(json.errors.map(e => e.message).join('; '));
+      }
       return json.data;
     } catch (err) {
+      clearTimeout(timeoutId);
       lastError = err;
-      // Tentar novamente apenas em erros de servidor (5xx) ou erros de rede (TypeError)
-      const isRetryable = /^HTTP 5\d\d$/.test(err.message) || err instanceof TypeError;
+
+      const isTimeout = err.name === 'AbortError';
+      // Tentar novamente apenas em erros de servidor (5xx), timeout ou erros de rede (TypeError)
+      const isRetryable = isTimeout || /^HTTP 5\d\d$/.test(err.message) || err instanceof TypeError;
+
+      if (isTimeout) {
+        console.warn(`${LOG_PREFIX} Pedido timeout após ${GRAPHQL_FETCH_TIMEOUT_MS}ms (tentativa ${attempt + 1}/${GRAPHQL_MAX_RETRIES + 1})`);
+        lastError = new Error(`Timeout após ${GRAPHQL_FETCH_TIMEOUT_MS / 1000}s`);
+      } else {
+        console.warn(`${LOG_PREFIX} Erro na tentativa ${attempt + 1}/${GRAPHQL_MAX_RETRIES + 1}:`, err.message);
+      }
+
       if (attempt < GRAPHQL_MAX_RETRIES && isRetryable) {
-        await new Promise(r => setTimeout(r, GRAPHQL_RETRY_DELAY_MS * (attempt + 1)));
+        const waitMs = GRAPHQL_RETRY_DELAY_MS * (attempt + 1);
+        console.info(`${LOG_PREFIX} A tentar novamente em ${waitMs}ms…`);
+        await new Promise(r => setTimeout(r, waitMs));
         continue;
       }
       break;
@@ -166,6 +207,36 @@ async function graphql(query) {
   }
 
   throw lastError;
+}
+
+/**
+ * Executa um array de funções assíncronas com um limite de concorrência.
+ * Substitui Promise.allSettled directo para evitar sobrecarregar a API.
+ * @param {Array<() => Promise<any>>} tasks  Funções a executar
+ * @param {number} concurrency              Número máximo de tarefas em paralelo
+ * @returns {Promise<PromiseSettledResult[]>}
+ */
+async function runConcurrent(tasks, concurrency) {
+  const results = new Array(tasks.length);
+  let nextIdx = 0;
+
+  async function worker() {
+    while (nextIdx < tasks.length) {
+      const idx = nextIdx++;
+      try {
+        results[idx] = { status: 'fulfilled', value: await tasks[idx]() };
+      } catch (reason) {
+        results[idx] = { status: 'rejected', reason };
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, tasks.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  return results;
 }
 
 // ── Cache persistente (localStorage) ────────────────────────────────────────
@@ -251,33 +322,35 @@ async function fetchRoutesAndPatterns() {
 
 /**
  * Obtém todas as trips de um padrão com os respectivos stoptimes.
+ * Usa variáveis GraphQL em vez de interpolação directa para maior segurança.
  * @param {string} patternId
  * @returns {Promise<object|null>}
  */
 async function fetchPatternTrips(patternId) {
-  // Escapar barras invertidas e aspas no ID para evitar quebrar a query GraphQL
-  const safeId = patternId.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const data = await graphql(`{
-    pattern(id: "${safeId}") {
-      trips {
-        id
-        tripHeadsign
-        stoptimes {
-          stop {
-            id
-            name
-            lat
-            lon
+  const data = await graphql(
+    `query PatternTrips($id: String!) {
+      pattern(id: $id) {
+        trips {
+          id
+          tripHeadsign
+          stoptimes {
+            stop {
+              id
+              name
+              lat
+              lon
+            }
+            scheduledArrival
+            scheduledDeparture
+            realtimeArrival
+            realtimeDeparture
+            realtime
           }
-          scheduledArrival
-          scheduledDeparture
-          realtimeArrival
-          realtimeDeparture
-          realtime
         }
       }
-    }
-  }`);
+    }`,
+    { id: patternId },
+  );
   return data.pattern;
 }
 
@@ -953,7 +1026,7 @@ async function loadSTCPBuses() {
           upsertBusMarker(tripId, pos, lineName, headsign, fromStop, toStop);
         });
       } catch (err) {
-        console.warn(`[STCP] Erro ao carregar pattern ${pattern.id}:`, err);
+        console.warn(`${LOG_PREFIX} [STCP] Erro ao carregar pattern ${pattern.id}:`, err);
       }
 
       // Pequena pausa após cada pedido para não sobrecarregar a API
@@ -992,7 +1065,7 @@ async function loadAndRender() {
           const stale = loadStaleRoutesFromCache();
           if (stale) {
             cachedRoutes = stale;
-            console.warn('[MetroPorto] API indisponível; a usar cache expirada para rotas.');
+            console.warn(`${LOG_PREFIX} API indisponível; a usar cache expirada para rotas.`);
             showError('API temporariamente indisponível. A mostrar rotas em cache.', false);
           } else {
             // Sem cache alguma — não é possível continuar
@@ -1017,23 +1090,27 @@ async function loadAndRender() {
     const activeTripIds = new Set();
     const countsByLine  = {};
 
-    // Processar os patterns de todas as linhas em paralelo (Promise.allSettled)
+    // Processar os patterns de todas as linhas com limite de concorrência
+    // para não sobrecarregar a API com demasiados pedidos em simultâneo.
     const patternFetches = cachedRoutes.flatMap(route =>
-      route.patterns.map(pattern => ({
-        route,
-        pattern,
-        promise: fetchPatternTrips(pattern.id),
-      }))
+      route.patterns.map(pattern => ({ route, pattern }))
     );
 
-    const results = await Promise.allSettled(
-      patternFetches.map(({ promise }) => promise)
+    const results = await runConcurrent(
+      patternFetches.map(({ pattern }) => () => fetchPatternTrips(pattern.id)),
+      GRAPHQL_MAX_CONCURRENT,
     );
 
     let failedCount = 0;
     results.forEach((result, idx) => {
       if (result.status !== 'fulfilled' || !result.value) {
         failedCount++;
+        if (result.status === 'rejected') {
+          console.warn(
+            `${LOG_PREFIX} Falha no pattern ${patternFetches[idx].pattern.id}:`,
+            result.reason,
+          );
+        }
         return;
       }
 
@@ -1059,6 +1136,9 @@ async function loadAndRender() {
       });
     });
 
+    if (failedCount > 0) {
+      console.warn(`${LOG_PREFIX} ${failedCount}/${results.length} patterns falharam.`);
+    }
     if (failedCount === results.length && results.length > 0) {
       showError('Não foi possível obter posições em tempo real. A tentar novamente em breve…', false);
     }
@@ -1076,7 +1156,7 @@ async function loadAndRender() {
     await loadSTCPBuses();
 
   } catch (err) {
-    console.error('[MetroPorto] Erro ao carregar dados:', err);
+    console.error(`${LOG_PREFIX} Erro ao carregar dados:`, err);
     showError(`Erro ao carregar dados: ${err.message}`, false);
   } finally {
     hideLoading();
