@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🚇 Metro Porto — Tracker em Tempo Real</title>
+
+  <!-- MapLibre GL JS (CDN) -->
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+  <!-- Estilos da aplicação -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── Botão toggle sidebar (mobile) ─────────────────── -->
+  <button id="toggle-sidebar" aria-label="Abrir/fechar painel">☰</button>
+
+  <!-- ── Sidebar ────────────────────────────────────────── -->
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <h1>🚇 Metro Porto</h1>
+    </div>
+
+    <div id="sidebar-body">
+      <!-- Última actualização -->
+      <p id="last-updated">A carregar…</p>
+
+      <!-- Comboios activos por linha -->
+      <div>
+        <p class="section-title">Comboios activos</p>
+        <div id="active-trains">
+          <!-- Preenchido dinamicamente por app.js -->
+        </div>
+      </div>
+
+      <!-- Legenda das linhas -->
+      <div>
+        <p class="section-title">Legenda</p>
+        <div id="legend">
+          <!-- Preenchido dinamicamente por app.js -->
+        </div>
+      </div>
+
+      <!-- Botão de atualização manual -->
+      <button id="refresh-btn">↻ Atualizar agora</button>
+    </div>
+  </aside>
+
+  <!-- ── Mapa ───────────────────────────────────────────── -->
+  <div id="map"></div>
+
+  <!-- ── Loading overlay ───────────────────────────────── -->
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <p id="loading-text">A carregar dados do Metro do Porto…</p>
+  </div>
+
+  <!-- ── Mensagem de erro ───────────────────────────────── -->
+  <div id="error-banner" class="hidden">
+    ⚠️ <span id="error-message">Erro ao carregar dados.</span>
+  </div>
+
+  <!-- Lógica da aplicação -->
+  <script src="app.js"></script>
+</body>
+</html>
