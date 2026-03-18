@@ -14,6 +14,12 @@ const GRAPHQL_URL = 'https://otp.services.porto.digital/otp/routers/default/inde
 /** Intervalo de actualização automática (milissegundos) */
 const REFRESH_INTERVAL_MS = 30_000;
 
+/** Segundos num dia (usado na normalização de stoptimes que cruzam a meia-noite) */
+const SECONDS_PER_DAY = 86400;
+
+/** Segundos numa hora */
+const SECONDS_PER_HOUR = 3600;
+
 /**
  * Cores oficiais das linhas do Metro do Porto.
  * Chave = shortName da rota (ex: "A", "B", …)
@@ -80,12 +86,12 @@ function secondsSinceMidnight() {
 
 /**
  * Formata um número de segundos desde meia-noite como "HH:MM".
- * Aceita valores > 86400 (dia seguinte).
+ * Aceita valores > SECONDS_PER_DAY (dia seguinte).
  * @param {number} secs
  * @returns {string}
  */
 function secsToHHMM(secs) {
-  const s = secs % 86400;
+  const s = secs % SECONDS_PER_DAY;
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
@@ -142,8 +148,8 @@ async function fetchRoutesAndPatterns() {
  * @returns {Promise<object|null>}
  */
 async function fetchPatternTrips(patternId) {
-  // Escapar aspas no ID para evitar quebrar a query
-  const safeId = patternId.replace(/"/g, '\\"');
+  // Escapar barras invertidas e aspas no ID para evitar quebrar a query GraphQL
+  const safeId = patternId.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const data = await graphql(`{
     pattern(id: "${safeId}") {
       trips {
@@ -174,7 +180,7 @@ async function fetchPatternTrips(patternId) {
  * Calcula a posição estimada de um comboio entre duas paragens,
  * com base no tempo actual e nos stoptimes da viagem.
  *
- * Tratamento de meia-noite: stoptimes podem exceder 86400s (viagens que
+ * Tratamento de meia-noite: stoptimes podem exceder SECONDS_PER_DAY (viagens que
  * começam antes e terminam depois da meia-noite).
  *
  * @param {Array}  stoptimes  Lista de stoptimes da trip
@@ -191,14 +197,14 @@ function estimateTripPosition(stoptimes, nowSec) {
     let arr = next.realtimeArrival   ?? next.scheduledArrival;
 
     // Normalizar para o domínio de "segundos desde meia-noite".
-    // Stoptimes podem ultrapassar 86400 para viagens da noite; se nowSec
+    // Stoptimes podem ultrapassar SECONDS_PER_DAY para viagens da noite; se nowSec
     // for pequeno (início do dia) e o stoptime for muito grande, ajustamos.
     let depNorm = dep;
     let arrNorm = arr;
 
-    // Se o segmento cruzar a meia-noite (dep > 86400)
+    // Se o segmento cruzar a meia-noite (dep > SECONDS_PER_DAY)
     // ajustamos nowSec para o mesmo domínio
-    const nowAdj = (dep > 86400 && nowSec < 3600) ? nowSec + 86400 : nowSec;
+    const nowAdj = (dep > SECONDS_PER_DAY && nowSec < SECONDS_PER_HOUR) ? nowSec + SECONDS_PER_DAY : nowSec;
 
     if (depNorm <= nowAdj && nowAdj <= arrNorm) {
       const duration = arrNorm - depNorm;
